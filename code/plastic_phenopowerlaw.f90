@@ -60,6 +60,14 @@ module plastic_phenopowerlaw
    plastic_phenopowerlaw_p_act, &                                                              ! activation barrier shape exponent p
    plastic_phenopowerlaw_q_act, &                                                              ! activation barrier shape exponent q
    plastic_phenopowerlaw_temperature, &                                                        ! temperature [K]
+   plastic_phenopowerlaw_gdot_ref, &          ! reference shear rate used in Lim B(T,gdot)
+   plastic_phenopowerlaw_lim_A, &             ! obstacle hardening coefficient
+   plastic_phenopowerlaw_lim_mu, &            ! shear modulus [Pa]
+   plastic_phenopowerlaw_lim_burgers, &       ! Burgers vector [m]
+   plastic_phenopowerlaw_lim_k1, &            ! dislocation storage coefficient [m^-1]
+   plastic_phenopowerlaw_lim_k2, &            ! dynamic recovery coefficient
+   plastic_phenopowerlaw_rho0_slip, &         ! initial dislocation density [m^-2]
+   plastic_phenopowerlaw_aTolRho, &           ! absolute tolerance for rho
    plastic_phenopowerlaw_spr, &                                                                !< push-up factor for slip saturation due to twinning
    plastic_phenopowerlaw_twinB, &
    plastic_phenopowerlaw_twinC, &
@@ -84,6 +92,7 @@ module plastic_phenopowerlaw
    plastic_phenopowerlaw_tausat_slip, &                                                        !< maximum critical shear stress for slip (input parameter, per family)
    plastic_phenopowerlaw_H_int, &                                                              !< per family hardening activity(input parameter(optional), per family)
    plastic_phenopowerlaw_nonSchmidCoeff, &
+   plastic_phenopowerlaw_limC, &
 
    plastic_phenopowerlaw_interaction_SlipSlip, &                                               !< interaction factors slip - slip (input parameter)
    plastic_phenopowerlaw_interaction_SlipTwin, &                                               !< interaction factors slip - twin (input parameter)
@@ -116,13 +125,14 @@ module plastic_phenopowerlaw
 
  type, private :: tPhenopowerlawState
    real(pReal), pointer,     dimension(:,:) :: &
-     s_slip, &
-     s_twin, &
-     accshear_slip, &
-     accshear_twin
+    s_slip, &
+    s_twin, &
+    accshear_slip, &
+    accshear_twin, &
+    rho_slip
    real(pReal), pointer,     dimension(:) :: &
-     sumGamma, &
-     sumF
+    sumGamma, &
+    sumF
  end type
 
  type(tPhenopowerlawState), allocatable, dimension(:), private :: &
@@ -141,6 +151,169 @@ module plastic_phenopowerlaw
 
 
 contains
+
+!==================================================================================================
+! Lim. et al A multi-scale model of dislocation plasticity in α-Fe: Incorporating temperature, strain rate and non-Schmid effects
+!==================================================================================================
+
+!--------------------------------------------------------------------------------------------------
+!> @brief projection function sigma (u x v) from Lim.
+!--------------------------------------------------------------------------------------------------
+real(pReal) function plastic_phenopowerlaw_projectUV(Tstar_v,u,v)
+ use math, only: &
+   math_tensorproduct33, &
+   math_symmetric33, &
+   math_Mandel33to6
+
+ implicit none
+
+ real(pReal), dimension(6), intent(in) :: Tstar_v
+ real(pReal), dimension(3), intent(in) :: u,v
+
+ real(pReal), dimension(3,3) :: P33
+ real(pReal), dimension(6)   :: P6
+
+ P33 = math_symmetric33(math_tensorproduct33(u,v))
+ P6  = math_Mandel33to6(P33)
+
+ plastic_phenopowerlaw_projectUV = dot_product(Tstar_v,P6)
+
+end function plastic_phenopowerlaw_projectUV
+
+!--------------------------------------------------------------------------------------------------
+!> @brief B(T, g_dot) function from Lim.
+!--------------------------------------------------------------------------------------------------
+real(pReal) function plastic_phenopowerlaw_limB(instance)
+ implicit none
+
+ integer(pInt), intent(in) :: instance
+
+ real(pReal), parameter :: kB_eV = 8.617333262145e-5_pReal
+ real(pReal) :: arg, logTerm
+
+ if (plastic_phenopowerlaw_temperature(instance) <= 0.0_pReal) then
+   plastic_phenopowerlaw_limB = 1.0_pReal
+   return
+ endif
+
+ if (plastic_phenopowerlaw_deltaF0(instance) <= 0.0_pReal .or. &
+     plastic_phenopowerlaw_gdot0_thermal(instance) <= plastic_phenopowerlaw_gdot_ref(instance)) then
+   plastic_phenopowerlaw_limB = 0.0_pReal
+   return
+ endif
+
+ logTerm = log(plastic_phenopowerlaw_gdot0_thermal(instance) / &
+               plastic_phenopowerlaw_gdot_ref(instance))
+
+ arg = kB_eV * plastic_phenopowerlaw_temperature(instance) / &
+       plastic_phenopowerlaw_deltaF0(instance) * logTerm
+
+ if (arg >= 1.0_pReal) then
+   plastic_phenopowerlaw_limB = 0.0_pReal
+ else
+   plastic_phenopowerlaw_limB = &
+     (1.0_pReal - arg**(1.0_pReal/plastic_phenopowerlaw_q_act(instance)))** &
+                  (1.0_pReal/plastic_phenopowerlaw_p_act(instance))
+ endif
+
+ plastic_phenopowerlaw_limB = max(0.0_pReal,min(1.0_pReal,plastic_phenopowerlaw_limB))
+
+end function plastic_phenopowerlaw_limB
+
+!--------------------------------------------------------------------------------------------------
+!> @brief thermal resistance function from Lim.
+!--------------------------------------------------------------------------------------------------
+real(pReal) function plastic_phenopowerlaw_limThermalResistance(Tstar_v,slipID,ph,instance,tau_schmid)
+ use lattice, only: &
+   lattice_sd, &
+   lattice_sn, &
+   lattice_st
+
+ implicit none
+
+ real(pReal), dimension(6), intent(in) :: Tstar_v
+ integer(pInt), intent(in) :: slipID, ph, instance
+ real(pReal), intent(in) :: tau_schmid
+
+ real(pReal), dimension(3) :: mVec,nVec,tVec
+ real(pReal) :: B, Pmt, Ptn, Pnn, Ptt, Pmm, sgn
+
+ if (tau_schmid >= 0.0_pReal) then
+   sgn = 1.0_pReal
+ else
+   sgn = -1.0_pReal
+ endif
+
+ mVec = sgn*lattice_sd(1:3,slipID,ph)
+ nVec = lattice_sn(1:3,slipID,ph)
+ tVec = sgn*lattice_st(1:3,slipID,ph)
+
+ B = plastic_phenopowerlaw_limB(instance)
+
+ Pmt = plastic_phenopowerlaw_projectUV(Tstar_v,mVec,tVec)
+ Ptn = plastic_phenopowerlaw_projectUV(Tstar_v,tVec,nVec)
+ Pnn = plastic_phenopowerlaw_projectUV(Tstar_v,nVec,nVec)
+ Ptt = plastic_phenopowerlaw_projectUV(Tstar_v,tVec,tVec)
+ Pmm = plastic_phenopowerlaw_projectUV(Tstar_v,mVec,mVec)
+
+ plastic_phenopowerlaw_limThermalResistance = &
+     B*( plastic_phenopowerlaw_tauP(instance) &
+       - plastic_phenopowerlaw_limC(2,instance)*Ptn &
+       - plastic_phenopowerlaw_limC(3,instance)*Pnn &
+       - plastic_phenopowerlaw_limC(4,instance)*Ptt &
+       - plastic_phenopowerlaw_limC(5,instance)*Pmm ) &
+       - plastic_phenopowerlaw_limC(1,instance)*Pmt
+
+ plastic_phenopowerlaw_limThermalResistance = &
+   max(0.0_pReal,plastic_phenopowerlaw_limThermalResistance)
+
+end function plastic_phenopowerlaw_limThermalResistance
+
+!--------------------------------------------------------------------------------------------------
+!> @brief obstacle resistance function from Lim.
+!--------------------------------------------------------------------------------------------------
+real(pReal) function plastic_phenopowerlaw_limObstacleResistance(instance,of)
+ implicit none
+
+ integer(pInt), intent(in) :: instance, of
+
+ real(pReal) :: rhoSum
+
+ rhoSum = sum(max(state(instance)%rho_slip(:,of),0.0_pReal))
+
+ plastic_phenopowerlaw_limObstacleResistance = &
+   plastic_phenopowerlaw_lim_A(instance) * &
+   plastic_phenopowerlaw_lim_mu(instance) * &
+   plastic_phenopowerlaw_lim_burgers(instance) * &
+   sqrt(max(rhoSum,0.0_pReal))
+
+end function plastic_phenopowerlaw_limObstacleResistance
+
+!--------------------------------------------------------------------------------------------------
+!> @brief slip resistance function from Lim.
+!--------------------------------------------------------------------------------------------------
+real(pReal) function plastic_phenopowerlaw_limSlipResistance(Tstar_v,slipID,ph,instance,of,tau_schmid)
+ implicit none
+
+ real(pReal), dimension(6), intent(in) :: Tstar_v
+ integer(pInt), intent(in) :: slipID, ph, instance, of
+ real(pReal), intent(in) :: tau_schmid
+
+ real(pReal) :: tstar, tobs
+
+ tstar = plastic_phenopowerlaw_limThermalResistance(Tstar_v,slipID,ph,instance,tau_schmid)
+ tobs  = plastic_phenopowerlaw_limObstacleResistance(instance,of)
+
+ plastic_phenopowerlaw_limSlipResistance = sqrt(tstar*tstar + tobs*tobs)
+
+ plastic_phenopowerlaw_limSlipResistance = &
+   max(plastic_phenopowerlaw_limSlipResistance,1.0e-12_pReal)
+
+end function plastic_phenopowerlaw_limSlipResistance
+
+!==================================================================================================
+! Lim. et al A multi-scale model of dislocation plasticity in α-Fe: Incorporating temperature, strain rate and non-Schmid effects
+!==================================================================================================
 
 !--------------------------------------------------------------------------------------------------
 !> @brief thermal activation based slip rate
@@ -189,7 +362,6 @@ pure real(pReal) function plastic_phenopowerlaw_thermalSlipRate(tau,instance)
    plastic_phenopowerlaw_gdot0_thermal(instance)*exp(exponent)*sign(1.0_pReal,tau)
 
 end function plastic_phenopowerlaw_thermalSlipRate
-
 
 !--------------------------------------------------------------------------------------------------
 !> @brief derivative of thermal activation based slip rate with respect to tau
@@ -344,6 +516,14 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
  allocate(plastic_phenopowerlaw_p_act(maxNinstance),          source=1.0_pReal)
  allocate(plastic_phenopowerlaw_q_act(maxNinstance),          source=1.0_pReal)
  allocate(plastic_phenopowerlaw_temperature(maxNinstance),    source=300.0_pReal)
+ allocate(plastic_phenopowerlaw_gdot_ref(maxNinstance),       source=1.0e-4_pReal)
+ allocate(plastic_phenopowerlaw_lim_A(maxNinstance),          source=0.4_pReal)
+ allocate(plastic_phenopowerlaw_lim_mu(maxNinstance),         source=69.7e9_pReal)
+ allocate(plastic_phenopowerlaw_lim_burgers(maxNinstance),    source=2.48e-10_pReal)
+ allocate(plastic_phenopowerlaw_lim_k1(maxNinstance),         source=7.0e8_pReal)
+ allocate(plastic_phenopowerlaw_lim_k2(maxNinstance),         source=50.0_pReal)
+ allocate(plastic_phenopowerlaw_rho0_slip(maxNinstance),      source=1.0e12_pReal)
+ allocate(plastic_phenopowerlaw_aTolRho(maxNinstance),        source=1.0e6_pReal)
  allocate(plastic_phenopowerlaw_tau0_slip(lattice_maxNslipFamily,maxNinstance),source=0.0_pReal)
  allocate(plastic_phenopowerlaw_tausat_slip(lattice_maxNslipFamily,maxNinstance),source=0.0_pReal)
  allocate(plastic_phenopowerlaw_H_int(lattice_maxNslipFamily,maxNinstance),source=0.0_pReal)
@@ -373,6 +553,7 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
  allocate(plastic_phenopowerlaw_aTolTransfrac(maxNinstance),                     source=0.0_pReal)
  allocate(plastic_phenopowerlaw_nonSchmidCoeff(lattice_maxNnonSchmid,maxNinstance), &
                                                                                  source=0.0_pReal)
+ allocate(plastic_phenopowerlaw_limC(5_pInt,maxNinstance), source=0.0_pReal)
  allocate(plastic_phenopowerlaw_Cnuc(maxNinstance),                              source=0.0_pReal)
  allocate(plastic_phenopowerlaw_Cdwp(maxNinstance),                              source=0.0_pReal)
  allocate(plastic_phenopowerlaw_Cgro(maxNinstance),                              source=0.0_pReal)
@@ -585,6 +766,28 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
        case ('temperature')
         plastic_phenopowerlaw_temperature(instance) = IO_floatValue(line,chunkPos,2_pInt)
 
+        case ('gdot_ref')
+          plastic_phenopowerlaw_gdot_ref(instance) = IO_floatValue(line,chunkPos,2_pInt)
+
+       case ('lim_c')
+          do j = 1_pInt,5_pInt
+            plastic_phenopowerlaw_limC(j,instance) = IO_floatValue(line,chunkPos,1_pInt+j)
+         enddo
+       case ('lim_a')
+          plastic_phenopowerlaw_lim_A(instance) = IO_floatValue(line,chunkPos,2_pInt)
+       case ('lim_mu')
+          plastic_phenopowerlaw_lim_mu(instance) = IO_floatValue(line,chunkPos,2_pInt)
+       case ('lim_burgers')
+          plastic_phenopowerlaw_lim_burgers(instance) = IO_floatValue(line,chunkPos,2_pInt)
+       case ('lim_k1')
+          plastic_phenopowerlaw_lim_k1(instance) = IO_floatValue(line,chunkPos,2_pInt)
+       case ('lim_k2')
+          plastic_phenopowerlaw_lim_k2(instance) = IO_floatValue(line,chunkPos,2_pInt)
+       case ('rho0_slip')
+          plastic_phenopowerlaw_rho0_slip(instance) = IO_floatValue(line,chunkPos,2_pInt)
+       case ('atol_rho')
+          plastic_phenopowerlaw_aTolRho(instance) = IO_floatValue(line,chunkPos,2_pInt)
+
        case ('a_slip', 'w0_slip')
          plastic_phenopowerlaw_a_slip(instance) = IO_floatValue(line,chunkPos,2_pInt)
        case ('gdot0_twin')
@@ -674,8 +877,8 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
        plastic_phenopowerlaw_aTolTransfrac(instance) = 1.0e-6_pReal                                     ! default absolute tolerance 1e-6
 
      if (plastic_phenopowerlaw_flowLaw(instance) < 1_pInt .or. &
-        plastic_phenopowerlaw_flowLaw(instance) > 2_pInt) &
-       call IO_error(211_pInt,el=instance,ext_msg='flow_law ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       plastic_phenopowerlaw_flowLaw(instance) > 3_pInt) &
+     call IO_error(211_pInt,el=instance,ext_msg='flow_law ('//PLASTICITY_PHENOPOWERLAW_label//')')
 
      if (plastic_phenopowerlaw_flowLaw(instance) == 2_pInt) then
        if (plastic_phenopowerlaw_gdot0_thermal(instance) <= 0.0_pReal) &
@@ -690,6 +893,33 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
          call IO_error(211_pInt,el=instance,ext_msg='p_activation ('//PLASTICITY_PHENOPOWERLAW_label//')')
        if (plastic_phenopowerlaw_q_act(instance) <= 0.0_pReal) &
          call IO_error(211_pInt,el=instance,ext_msg='q_activation ('//PLASTICITY_PHENOPOWERLAW_label//')')
+     endif
+
+     if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+       if (plastic_phenopowerlaw_gdot0_slip(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='gdot0_slip ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_n_slip(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='n_slip ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_gdot0_thermal(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='gdot0_thermal ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_gdot_ref(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='gdot_ref ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_deltaF0(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='deltaF0 ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_tauP(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='tauP/tcr ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_temperature(instance) < 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='temperature ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_p_act(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='p_activation ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_q_act(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='q_activation ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_lim_mu(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='lim_mu ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_lim_burgers(instance) <= 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='lim_burgers ('//PLASTICITY_PHENOPOWERLAW_label//')')
+       if (plastic_phenopowerlaw_rho0_slip(instance) < 0.0_pReal) &
+         call IO_error(211_pInt,el=instance,ext_msg='rho0_slip ('//PLASTICITY_PHENOPOWERLAW_label//')')
      endif
    endif myPhase
  enddo sanityChecks
@@ -749,11 +979,12 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
      enddo outputsLoop
 !--------------------------------------------------------------------------------------------------
 ! allocate state arrays
-     sizeState = plastic_phenopowerlaw_totalNslip(instance) &                         ! s_slip
-               + plastic_phenopowerlaw_totalNtwin(instance) &                         ! s_twin
-               + 2_pInt &                                                             ! sum(gamma) + sum(f)
-               + plastic_phenopowerlaw_totalNslip(instance) &                         ! accshear_slip
-               + plastic_phenopowerlaw_totalNtwin(instance)                           ! accshear_twin
+     sizeState = plastic_phenopowerlaw_totalNslip(instance) &      ! s_slip
+          + plastic_phenopowerlaw_totalNtwin(instance) &      ! s_twin
+          + 2_pInt &                                          ! sumGamma + sumF
+          + plastic_phenopowerlaw_totalNslip(instance) &      ! accshear_slip
+          + plastic_phenopowerlaw_totalNtwin(instance) &      ! accshear_twin
+          + plastic_phenopowerlaw_totalNslip(instance)        ! rho_slip
 
      sizeDotState = sizeState
      sizeDeltaState = 0_pInt
@@ -876,6 +1107,12 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
      state0  (instance)%accshear_twin=>plasticState(phase)%state0  (startIndex:endIndex,:)
      dotState(instance)%accshear_twin=>plasticState(phase)%dotState(startIndex:endIndex,:)
 
+     startIndex = endIndex + 1_pInt
+     endIndex   = endIndex + plastic_phenopowerlaw_totalNslip(instance)
+     state   (instance)%rho_slip=>plasticState(phase)%state   (startIndex:endIndex,:)
+     state0  (instance)%rho_slip=>plasticState(phase)%state0  (startIndex:endIndex,:)
+     dotState(instance)%rho_slip=>plasticState(phase)%dotState(startIndex:endIndex,:)
+
 
      call plastic_phenopowerlaw_stateInit(phase,instance)
      call plastic_phenopowerlaw_aTolState(phase,instance)
@@ -919,6 +1156,16 @@ subroutine plastic_phenopowerlaw_stateInit(ph,instance)
      plastic_phenopowerlaw_tau0_twin(i,instance)
  enddo
 
+ i = plastic_phenopowerlaw_totalNslip(instance) + &
+    plastic_phenopowerlaw_totalNtwin(instance) + &
+    2_pInt + &
+    plastic_phenopowerlaw_totalNslip(instance) + &
+    plastic_phenopowerlaw_totalNtwin(instance)
+
+ if (plastic_phenopowerlaw_totalNslip(instance) > 0_pInt) &
+  tempState(i+1_pInt:i+plastic_phenopowerlaw_totalNslip(instance)) = &
+    plastic_phenopowerlaw_rho0_slip(instance)
+
  plasticState(ph)%state0(:,:) = spread(tempState, &                                                 ! spread single tempstate array
                                        2, &                                                         ! along dimension 2
                                        size(plasticState(ph)%state0(1,:)))                          ! number of copies (number of IPCs)
@@ -952,6 +1199,12 @@ subroutine plastic_phenopowerlaw_aTolState(ph,instance)
                             2+2*(plastic_phenopowerlaw_totalNslip(instance)+ &
                                  plastic_phenopowerlaw_totalNtwin(instance))) = &
                                              plastic_phenopowerlaw_aTolShear(instance)
+ plasticState(ph)%aTolState(3_pInt + 2_pInt*(plastic_phenopowerlaw_totalNslip(instance) + &
+                                            plastic_phenopowerlaw_totalNtwin(instance)) : &
+                            2_pInt + 2_pInt*(plastic_phenopowerlaw_totalNslip(instance) + &
+                                            plastic_phenopowerlaw_totalNtwin(instance)) + &
+                                            plastic_phenopowerlaw_totalNslip(instance)) = &
+                                            plastic_phenopowerlaw_aTolRho(instance)
 
 end subroutine plastic_phenopowerlaw_aTolState
 
@@ -1000,6 +1253,7 @@ subroutine plastic_phenopowerlaw_LpAndItsTangent(Lp,dLp_dTstar99,Tstar_v,ipc,ip,
    ph
  real(pReal) :: &
    tau_slip_pos,tau_slip_neg, &
+   tau_schmid, g_lim, gdot_total, dgdot_total_dtau, &
    gdot_slip_pos,gdot_slip_neg, &
    dgdot_dtauslip_pos,dgdot_dtauslip_neg, &
    gdot_twin,dgdot_dtautwin,tau_twin
@@ -1070,13 +1324,38 @@ subroutine plastic_phenopowerlaw_LpAndItsTangent(Lp,dLp_dTstar99,Tstar_v,ipc,ip,
        dgdot_dtauslip_pos = 0.5_pReal*plastic_phenopowerlaw_dThermalSlipRate_dtau(tau_slip_pos,instance)
        dgdot_dtauslip_neg = 0.5_pReal*plastic_phenopowerlaw_dThermalSlipRate_dtau(tau_slip_neg,instance)
 
+     else if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+
+       tau_schmid = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+ 
+       g_lim = plastic_phenopowerlaw_limSlipResistance(Tstar_v,index_myFamily+i,ph,instance,of,tau_schmid)
+ 
+       gdot_total = plastic_phenopowerlaw_gdot0_slip(instance) * &
+                   (abs(tau_schmid)/g_lim)**plastic_phenopowerlaw_n_slip(instance) * &
+                   sign(1.0_pReal,tau_schmid)
+ 
+       gdot_slip_pos = 0.5_pReal*gdot_total
+       gdot_slip_neg = 0.5_pReal*gdot_total
+
+       if (abs(tau_schmid) > 1.0e-30_pReal) then
+        dgdot_total_dtau = gdot_total*plastic_phenopowerlaw_n_slip(instance)/tau_schmid
+       else
+         dgdot_total_dtau = 0.0_pReal
+       endif
+
+       dgdot_dtauslip_pos = 0.5_pReal*dgdot_total_dtau
+       dgdot_dtauslip_neg = 0.5_pReal*dgdot_total_dtau
+
+       nonSchmid_tensor(1:3,1:3,1) = lattice_Sslip(1:3,1:3,1,index_myFamily+i,ph)
+       nonSchmid_tensor(1:3,1:3,2) = lattice_Sslip(1:3,1:3,1,index_myFamily+i,ph)
+
      else
 
        gdot_slip_pos = 0.0_pReal
        gdot_slip_neg = 0.0_pReal
        dgdot_dtauslip_pos = 0.0_pReal
        dgdot_dtauslip_neg = 0.0_pReal
-
+ 
      endif
 
      Lp = Lp + (1.0_pReal-state(instance)%sumF(of))*&                                             ! 1-F
@@ -1163,12 +1442,13 @@ subroutine plastic_phenopowerlaw_dotState(Tstar_v,ipc,ip,el)
    nSlip,nTwin, &
    f,i,j,k, &
    index_Gamma,index_F,index_myFamily, &
-   offset_accshear_slip,offset_accshear_twin, &
+   offset_accshear_slip,offset_accshear_twin,offset_rho_slip, &
    of
  real(pReal) :: &
    c_SlipSlip,c_TwinSlip,c_TwinTwin, &
    ssat_offset, &
-   tau_slip_pos,tau_slip_neg,tau_twin
+   tau_slip_pos,tau_slip_neg,tau_twin, &
+   tau_schmid,g_lim,rhoSum
 
  real(pReal), dimension(plastic_phenopowerlaw_totalNslip(phase_plasticityInstance(material_phase(ipc,ip,el)))) :: &
    gdot_slip,left_SlipSlip,left_SlipTwin,right_SlipSlip,right_TwinSlip
@@ -1186,6 +1466,7 @@ subroutine plastic_phenopowerlaw_dotState(Tstar_v,ipc,ip,el)
  index_F     = nSlip + nTwin + 2_pInt
  offset_accshear_slip = nSlip + nTwin + 2_pInt
  offset_accshear_twin = nSlip + nTwin + 2_pInt + nSlip
+ offset_rho_slip = nSlip + nTwin + 2_pInt + nSlip + nTwin
  plasticState(ph)%dotState(:,of) = 0.0_pReal
 
 !--------------------------------------------------------------------------------------------------
@@ -1234,6 +1515,12 @@ subroutine plastic_phenopowerlaw_dotState(Tstar_v,ipc,ip,el)
      else if (plastic_phenopowerlaw_flowLaw(instance) == 2_pInt) then
        gdot_slip(j) = 0.5_pReal*(plastic_phenopowerlaw_thermalSlipRate(tau_slip_pos,instance) + &
                                 plastic_phenopowerlaw_thermalSlipRate(tau_slip_neg,instance))
+     else if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+       tau_schmid = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+       g_lim = plastic_phenopowerlaw_limSlipResistance(Tstar_v,index_myFamily+i,ph,instance,of,tau_schmid)
+       gdot_slip(j) = plastic_phenopowerlaw_gdot0_slip(instance) * &
+                    (abs(tau_schmid)/g_lim)**plastic_phenopowerlaw_n_slip(instance) * &
+                    sign(1.0_pReal,tau_schmid)
      else
        gdot_slip(j) = 0.0_pReal
     endif
@@ -1268,15 +1555,26 @@ subroutine plastic_phenopowerlaw_dotState(Tstar_v,ipc,ip,el)
  slipFamilies2: do f = 1_pInt,lattice_maxNslipFamily
    slipSystems2: do i = 1_pInt,plastic_phenopowerlaw_Nslip(f,instance)
      j = j+1_pInt
-     plasticState(ph)%dotState(j,of) = &                                                            ! evolution of slip resistance j
-       c_SlipSlip * left_SlipSlip(j) * &
-       dot_product(plastic_phenopowerlaw_hardeningMatrix_SlipSlip(j,1:nSlip,instance), &
-                   right_SlipSlip*abs(gdot_slip)) + &                                               ! dot gamma_slip modulated by right-side slip factor
-       dot_product(plastic_phenopowerlaw_hardeningMatrix_SlipTwin(j,1:nTwin,instance), &
-                   right_SlipTwin*gdot_twin)                                                        ! dot gamma_twin modulated by right-side twin factor
+     if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+       plasticState(ph)%dotState(j,of) = 0.0_pReal
+     else
+       plasticState(ph)%dotState(j,of) = &
+         c_SlipSlip * left_SlipSlip(j) * &
+         dot_product(plastic_phenopowerlaw_hardeningMatrix_SlipSlip(j,1:nSlip,instance), &
+                    right_SlipSlip*abs(gdot_slip)) + &
+         dot_product(plastic_phenopowerlaw_hardeningMatrix_SlipTwin(j,1:nTwin,instance), &
+                    right_SlipTwin*gdot_twin)
+     endif
      plasticState(ph)%dotState(index_Gamma,of) = plasticState(ph)%dotState(index_Gamma,of) + &
                                                         abs(gdot_slip(j))
      plasticState(ph)%dotState(offset_accshear_slip+j,of) = abs(gdot_slip(j))
+     if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+       rhoSum = sum(max(state(instance)%rho_slip(:,of),0.0_pReal))
+       plasticState(ph)%dotState(offset_rho_slip+j,of) = &
+         ( plastic_phenopowerlaw_lim_k1(instance)*sqrt(max(rhoSum,0.0_pReal)) &
+         - plastic_phenopowerlaw_lim_k2(instance)*max(state(instance)%rho_slip(j,of),0.0_pReal) ) * &
+          abs(gdot_slip(j))
+     endif
    enddo slipSystems2
  enddo slipFamilies2
 
@@ -1337,7 +1635,7 @@ function plastic_phenopowerlaw_postResults(Tstar_v,ipc,ip,el)
    o,f,i,c,j,k, &
    index_Gamma,index_F,index_accshear_slip,index_accshear_twin,index_myFamily
  real(pReal) :: &
-   tau_slip_pos,tau_slip_neg,tau
+   tau_slip_pos,tau_slip_neg,tau,g_lim
 
  of = phasememberAt(ipc,ip,el)
  ph = phaseAt(ipc,ip,el)
@@ -1357,8 +1655,22 @@ function plastic_phenopowerlaw_postResults(Tstar_v,ipc,ip,el)
  outputsLoop: do o = 1_pInt,plastic_phenopowerlaw_Noutput(instance)
    select case(plastic_phenopowerlaw_outputID(o,instance))
      case (resistance_slip_ID)
-       plastic_phenopowerlaw_postResults(c+1_pInt:c+nSlip) = plasticState(ph)%state(1:nSlip,of)
-       c = c + nSlip
+
+    if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+      j = 0_pInt
+      do f = 1_pInt,lattice_maxNslipFamily
+         index_myFamily = sum(lattice_NslipSystem(1:f-1_pInt,ph))
+        do i = 1_pInt,plastic_phenopowerlaw_Nslip(f,instance)
+           j = j + 1_pInt
+           tau = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+           plastic_phenopowerlaw_postResults(c+j) = &
+            plastic_phenopowerlaw_limSlipResistance(Tstar_v,index_myFamily+i,ph,instance,of,tau)
+        enddo
+      enddo
+    else
+      plastic_phenopowerlaw_postResults(c+1_pInt:c+nSlip) = plasticState(ph)%state(1:nSlip,of)
+    endif
+    c = c + nSlip
 
      case (accumulatedshear_slip_ID)
        plastic_phenopowerlaw_postResults(c+1_pInt:c+nSlip) = plasticState(ph)%state(index_accshear_slip:&
@@ -1389,6 +1701,12 @@ function plastic_phenopowerlaw_postResults(Tstar_v,ipc,ip,el)
              plastic_phenopowerlaw_postResults(c+j) = 0.5_pReal*( &
                 plastic_phenopowerlaw_thermalSlipRate(tau_slip_pos,instance) + &
                 plastic_phenopowerlaw_thermalSlipRate(tau_slip_neg,instance))
+          else if (plastic_phenopowerlaw_flowLaw(instance) == 3_pInt) then
+             tau = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+             g_lim = plastic_phenopowerlaw_limSlipResistance(Tstar_v,index_myFamily+i,ph,instance,of,tau)
+             plastic_phenopowerlaw_postResults(c+j) = plastic_phenopowerlaw_gdot0_slip(instance) * &
+                (abs(tau)/g_lim)**plastic_phenopowerlaw_n_slip(instance) * &
+                sign(1.0_pReal,tau)
           else
              plastic_phenopowerlaw_postResults(c+j) = 0.0_pReal
           endif
