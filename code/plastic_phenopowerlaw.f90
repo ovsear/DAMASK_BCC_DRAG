@@ -93,6 +93,8 @@ module plastic_phenopowerlaw
                  accumulatedshear_slip_ID, &
                  shearrate_slip_ID, &
                  resolvedstress_slip_ID, &
+                 resolvedstress_slip_pos_ID, &
+                 resolvedstress_slip_neg_ID, &
                  totalshear_ID, &
                  resistance_twin_ID, &
                  accumulatedshear_twin_ID, &
@@ -311,6 +313,18 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
            case ('resolvedstress_slip')
              plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
              plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = resolvedstress_slip_ID
+             plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
+                                                           IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+           
+           case ('resolvedstress_slip_pos')
+             plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
+             plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = resolvedstress_slip_pos_ID
+             plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
+                                                           IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+
+           case ('resolvedstress_slip_neg')
+             plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
+             plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = resolvedstress_slip_neg_ID
              plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
                                                            IO_lc(IO_stringValue(line,chunkPos,2_pInt))
            case ('totalshear')
@@ -556,7 +570,9 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
          case(resistance_slip_ID, &
               shearrate_slip_ID, &
               accumulatedshear_slip_ID, &
-              resolvedstress_slip_ID &
+              resolvedstress_slip_ID, &
+              resolvedstress_slip_pos_ID, &
+              resolvedstress_slip_neg_ID &
               )
            mySize = plastic_phenopowerlaw_totalNslip(instance)
          case(resistance_twin_ID, &
@@ -1191,6 +1207,46 @@ function plastic_phenopowerlaw_postResults(Tstar_v,ipc,ip,el)
                              dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
          enddo slipSystems2
        enddo slipFamilies2
+       c = c + nSlip
+      
+     case (resolvedstress_slip_pos_ID)
+       j = 0_pInt
+       slipFamilies2_pos: do f = 1_pInt,lattice_maxNslipFamily
+         index_myFamily = sum(lattice_NslipSystem(1:f-1_pInt,ph))
+         slipSystems2_pos: do i = 1_pInt,plastic_phenopowerlaw_Nslip(f,instance)
+           j = j + 1_pInt
+
+           tau_slip_pos = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+
+           do k = 1_pInt,lattice_NnonSchmid(ph)
+             tau_slip_pos = tau_slip_pos + plastic_phenopowerlaw_nonSchmidCoeff(k,instance)* &
+                            dot_product(Tstar_v,lattice_Sslip_v(1:6,2*k,index_myFamily+i,ph))
+           enddo
+
+           plastic_phenopowerlaw_postResults(c+j) = tau_slip_pos
+
+         enddo slipSystems2_pos
+       enddo slipFamilies2_pos
+       c = c + nSlip
+
+     case (resolvedstress_slip_neg_ID)
+       j = 0_pInt
+       slipFamilies2_neg: do f = 1_pInt,lattice_maxNslipFamily
+         index_myFamily = sum(lattice_NslipSystem(1:f-1_pInt,ph))
+         slipSystems2_neg: do i = 1_pInt,plastic_phenopowerlaw_Nslip(f,instance)
+           j = j + 1_pInt
+
+           tau_slip_neg = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+
+           do k = 1_pInt,lattice_NnonSchmid(ph)
+             tau_slip_neg = tau_slip_neg + plastic_phenopowerlaw_nonSchmidCoeff(k,instance)* &
+                            dot_product(Tstar_v,lattice_Sslip_v(1:6,2*k+1,index_myFamily+i,ph))
+           enddo
+
+           plastic_phenopowerlaw_postResults(c+j) = tau_slip_neg
+
+         enddo slipSystems2_neg
+       enddo slipFamilies2_neg
        c = c + nSlip
 
      case (totalshear_ID)
