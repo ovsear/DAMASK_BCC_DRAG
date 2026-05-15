@@ -105,21 +105,25 @@ module plastic_phenopowerlaw
    plastic_phenopowerlaw_hardeningMatrix_TwinSlip, &
    plastic_phenopowerlaw_hardeningMatrix_TwinTwin
 
- enum, bind(c)
-   enumerator :: undefined_ID, &
-                 resistance_slip_ID, &
-                 accumulatedshear_slip_ID, &
-                 shearrate_slip_ID, &
-                 resolvedstress_slip_ID, &
-                 resolvedstress_slip_pos_ID, &
-                 resolvedstress_slip_neg_ID, &
-                 totalshear_ID, &
-                 resistance_twin_ID, &
-                 accumulatedshear_twin_ID, &
-                 shearrate_twin_ID, &
-                 resolvedstress_twin_ID, &
-                 totalvolfrac_twin_ID
- end enum
+enum, bind(c)
+  enumerator :: undefined_ID, &
+                resistance_slip_ID, &
+                accumulatedshear_slip_ID, &
+                shearrate_slip_ID, &
+                resolvedstress_slip_ID, &
+                resolvedstress_slip_pos_ID, &
+                resolvedstress_slip_neg_ID, &
+                lim_tstar_slip_ID, &
+                rho_slip_ID, &
+                lim_B_ID, &
+                lim_tobs_ID, &
+                totalshear_ID, &
+                resistance_twin_ID, &
+                accumulatedshear_twin_ID, &
+                shearrate_twin_ID, &
+                resolvedstress_twin_ID, &
+                totalvolfrac_twin_ID
+end enum
  integer(kind(undefined_ID)),         dimension(:,:),   allocatable,          private :: &
    plastic_phenopowerlaw_outputID                                                              !< ID of each post result output
 
@@ -657,6 +661,31 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
              plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = totalvolfrac_twin_ID
              plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
                                                            IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+          
+           case ('lim_tstar_slip')
+             plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
+             plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = lim_tstar_slip_ID
+             plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
+                                                                   IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+ 
+           case ('rho_slip')
+             plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
+             plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = rho_slip_ID
+             plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
+                                                                   IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+ 
+           case ('lim_b')
+             plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
+             plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = lim_B_ID
+             plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
+                                                                  IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+ 
+           case ('lim_tobs')
+             plastic_phenopowerlaw_Noutput(instance) = plastic_phenopowerlaw_Noutput(instance) + 1_pInt
+             plastic_phenopowerlaw_outputID(plastic_phenopowerlaw_Noutput(instance),instance) = lim_tobs_ID
+             plastic_phenopowerlaw_output(plastic_phenopowerlaw_Noutput(instance),instance) = &
+                                                                  IO_lc(IO_stringValue(line,chunkPos,2_pInt))
+
            case default
 
          end select
@@ -956,9 +985,11 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
               accumulatedshear_slip_ID, &
               resolvedstress_slip_ID, &
               resolvedstress_slip_pos_ID, &
-              resolvedstress_slip_neg_ID &
+              resolvedstress_slip_neg_ID, &
+              lim_tstar_slip_ID, &
+              rho_slip_ID &
               )
-           mySize = plastic_phenopowerlaw_totalNslip(instance)
+            mySize = plastic_phenopowerlaw_totalNslip(instance)
          case(resistance_twin_ID, &
               shearrate_twin_ID, &
               accumulatedshear_twin_ID, &
@@ -966,9 +997,11 @@ subroutine plastic_phenopowerlaw_init(fileUnit)
               )
            mySize = plastic_phenopowerlaw_totalNtwin(instance)
          case(totalshear_ID, &
+              lim_B_ID, &
+              lim_tobs_ID, &
               totalvolfrac_twin_ID &
               )
-           mySize = 1_pInt
+            mySize = 1_pInt
          case default
        end select
 
@@ -1635,7 +1668,7 @@ function plastic_phenopowerlaw_postResults(Tstar_v,ipc,ip,el)
    o,f,i,c,j,k, &
    index_Gamma,index_F,index_accshear_slip,index_accshear_twin,index_myFamily
  real(pReal) :: &
-   tau_slip_pos,tau_slip_neg,tau,g_lim
+   tau_slip_pos,tau_slip_neg,tau,g_lim,tstar
 
  of = phasememberAt(ipc,ip,el)
  ph = phaseAt(ipc,ip,el)
@@ -1810,6 +1843,34 @@ function plastic_phenopowerlaw_postResults(Tstar_v,ipc,ip,el)
      case (totalvolfrac_twin_ID)
        plastic_phenopowerlaw_postResults(c+1_pInt) = plasticState(ph)%state(index_F,of)
        c = c + 1_pInt
+
+     case (lim_tstar_slip_ID)
+        j = 0_pInt
+        do f = 1_pInt,lattice_maxNslipFamily
+          index_myFamily = sum(lattice_NslipSystem(1:f-1_pInt,ph))
+          do i = 1_pInt,plastic_phenopowerlaw_Nslip(f,instance)
+            j = j + 1_pInt
+            tau = dot_product(Tstar_v,lattice_Sslip_v(1:6,1,index_myFamily+i,ph))
+            plastic_phenopowerlaw_postResults(c+j) = &
+              plastic_phenopowerlaw_limThermalResistance(Tstar_v,index_myFamily+i,ph,instance,tau)
+          enddo
+        enddo
+        c = c + nSlip
+
+      case (rho_slip_ID)
+        plastic_phenopowerlaw_postResults(c+1_pInt:c+nSlip) = &
+          state(instance)%rho_slip(1:nSlip,of)
+        c = c + nSlip
+
+      case (lim_B_ID)
+        plastic_phenopowerlaw_postResults(c+1_pInt) = &
+          plastic_phenopowerlaw_limB(instance)
+        c = c + 1_pInt
+
+      case (lim_tobs_ID)
+        plastic_phenopowerlaw_postResults(c+1_pInt) = &
+          plastic_phenopowerlaw_limObstacleResistance(instance,of)
+        c = c + 1_pInt
 
    end select
  enddo outputsLoop
