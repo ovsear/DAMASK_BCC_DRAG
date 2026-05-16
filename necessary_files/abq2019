@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+# Safe locale for Abaqus command-line jobs
+export LC_ALL=C
+export LANG=C
+export LANGUAGE=C
+
+# Abaqus license server
+export ABAQUSLM_LICENSE_FILE=27800@ubuntu18-04
+export LM_LICENSE_FILE=27800@ubuntu18-04:${LM_LICENSE_FILE}
+
+# Intel Parallel Studio XE 2016
+source /opt/intel/bin/compilervars.sh intel64
+source /opt/intel/compilers_and_libraries_2016.4.258/linux/mkl/bin/mklvars.sh intel64
+
+# Thread control for DAMASK
+export DAMASK_NUM_THREADS=16
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=1
+
+ulimit -s unlimited 2>/dev/null
+ulimit -d unlimited 2>/dev/null
+ulimit -v unlimited 2>/dev/null
+ulimit -m unlimited 2>/dev/null
+
+export KMP_AFFINITY=granularity=fine,compact,1,0
+
+# DAMASK environment, only for Abaqus/DAMASK command-line jobs
+if [ -f "$HOME/DAMASK/DAMASK_env.sh" ]; then
+    source "$HOME/DAMASK/DAMASK_env.sh" >/dev/null 2>&1
+fi
+
+exec /home/lian/SIMULIA/Commands/abq2019 "$@"

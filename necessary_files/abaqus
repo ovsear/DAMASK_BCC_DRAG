@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# Force Abaqus to use the safest locale
+export LC_ALL=C
+export LANG=C
+export LANGUAGE=C
+
+# Abaqus license server
+export ABAQUSLM_LICENSE_FILE=27800@ubuntu18-04
+export LM_LICENSE_FILE=27800@ubuntu18-04:${LM_LICENSE_FILE}
+
+# Intel Parallel Studio XE 2016
+source /opt/intel/bin/compilervars.sh intel64
+source /opt/intel/compilers_and_libraries_2016.4.258/linux/mkl/bin/mklvars.sh intel64
+
+if [ -f "$HOME/DAMASK/DAMASK_env.sh" ]; then
+    source "$HOME/DAMASK/DAMASK_env.sh" >/dev/null 2>&1
+fi
+
+# Call the real Abaqus command
+exec /home/lian/SIMULIA/Commands/abaqus "$@"
